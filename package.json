@@ -1,0 +1,17 @@
+{
+  "name": "groupme-discord-bridge",
+  "version": "1.0.0",
+  "description": "Bridge between GroupMe and Discord using GitHub Actions",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "echo \"No tests specified\" && exit 0"
+  },
+  "dependencies": {},
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "keywords": ["groupme", "discord", "bridge", "webhook"],
+  "author": "Your Name",
+  "license": "MIT"
+}
