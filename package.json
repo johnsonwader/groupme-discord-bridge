@@ -4,13 +4,10 @@
   "description": "Bridge between GroupMe and Discord using webhooks",
   "main": "server.js",
   "scripts": {
-    "start": "node index.js",
+    "start": "node server.js",
     "test": "echo \"No tests specified\" && exit 0"
   },
-  "dependencies": {
-    "express": "^4.18.2",
-    "axios": "^1.6.0"
-  },
+  "dependencies": {},
   "engines": {
     "node": ">=14.0.0"
   },
