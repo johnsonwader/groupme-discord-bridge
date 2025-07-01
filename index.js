@@ -1,4 +1,4 @@
-// GroupMe-Discord Bridge - Main Application File
+// GroupMe-Discord Bridge - Main Application File with Reaction Support
 const https = require('https');
 const http = require('http');
 const url = require('url');
@@ -28,6 +28,50 @@ function makeRequest(options, data = null) {
     }
     req.end();
   });
+}
+
+// Get original message from GroupMe API
+async function getGroupMeMessage(groupId, messageId) {
+  const options = {
+    hostname: 'api.groupme.com',
+    port: 443,
+    path: `/v3/groups/${groupId}/messages/${messageId}?token=${GROUPME_ACCESS_TOKEN}`,
+    method: 'GET',
+    protocol: 'https:',
+    headers: {
+      'User-Agent': 'GroupMe-Discord-Bridge/1.0'
+    }
+  };
+
+  try {
+    const response = await makeRequest(options);
+    if (response.statusCode === 200) {
+      const data = JSON.parse(response.body);
+      return data.response.message;
+    }
+    return null;
+  } catch (error) {
+    console.error('Error fetching GroupMe message:', error);
+    return null;
+  }
+}
+
+// Convert GroupMe reaction emoji to Discord format
+function convertReactionEmoji(groupmeEmoji) {
+  // GroupMe uses different emoji formats, this maps common ones
+  const emojiMap = {
+    '❤': '❤️',
+    '👍': '👍',
+    '👎': '👎',
+    '😂': '😂', 
+    '😢': '😢',
+    '😮': '😮',
+    '😡': '😡',
+    '👏': '👏',
+    '🪩': '🪩'
+  };
+  
+  return emojiMap[groupmeEmoji] || groupmeEmoji;
 }
 
 // Send message to Discord
@@ -70,6 +114,47 @@ async function sendToDiscord(message) {
   }
 }
 
+// Send reaction notification to Discord
+async function sendReactionToDiscord(reactionData, originalMessage) {
+  const webhookUrl = new URL(DISCORD_WEBHOOK_URL);
+  
+  const emoji = convertReactionEmoji(reactionData.favorited_by.emoji || '❤️');
+  const reacterName = reactionData.favorited_by.nickname || 'Someone';
+  
+  // Create a preview of the original message (truncate if too long)
+  let messagePreview = originalMessage.text || '[No text content]';
+  if (messagePreview.length > 100) {
+    messagePreview = messagePreview.substring(0, 97) + '...';
+  }
+  
+  const payload = {
+    username: 'GroupMe Reactions',
+    content: `${emoji} **${reacterName}** reacted to: "${messagePreview}"`,
+    avatar_url: reactionData.favorited_by.image_url || null
+  };
+
+  const options = {
+    hostname: webhookUrl.hostname,
+    port: webhookUrl.port || 443,
+    path: webhookUrl.pathname,
+    method: 'POST',
+    protocol: webhookUrl.protocol,
+    headers: {
+      'Content-Type': 'application/json',
+      'User-Agent': 'GroupMe-Discord-Bridge/1.0'
+    }
+  };
+
+  try {
+    const response = await makeRequest(options, JSON.stringify(payload));
+    console.log('Reaction sent to Discord:', response.statusCode);
+    return response.statusCode < 300;
+  } catch (error) {
+    console.error('Error sending reaction to Discord:', error);
+    return false;
+  }
+}
+
 // Send message to GroupMe
 async function sendToGroupMe(message) {
   const payload = {
@@ -99,6 +184,38 @@ async function sendToGroupMe(message) {
   }
 }
 
+// Handle GroupMe webhook data
+async function handleGroupMeWebhook(data) {
+  // Handle regular messages
+  if (data.sender_type === 'bot') {
+    // Ignore bot messages to prevent loops
+    return { success: true, ignored: true };
+  }
+  
+  // Handle reaction events
+  if (data.favorited_by && data.favorited_by.length > 0) {
+    console.log('Received GroupMe reaction event');
+    
+    // Get the most recent reaction (last item in favorited_by array)
+    const latestReaction = data.favorited_by[data.favorited_by.length - 1];
+    
+    // Create reaction data object
+    const reactionData = {
+      favorited_by: latestReaction,
+      message_id: data.id,
+      group_id: data.group_id
+    };
+    
+    // Send reaction to Discord
+    const success = await sendReactionToDiscord(reactionData, data);
+    return { success, type: 'reaction' };
+  }
+  
+  // Handle regular message
+  const success = await sendToDiscord(data);
+  return { success, type: 'message' };
+}
+
 // Create HTTP server
 const server = http.createServer(async (req, res) => {
   // Set CORS headers
@@ -121,10 +238,22 @@ const server = http.createServer(async (req, res) => {
         <head><title>GroupMe-Discord Bridge</title></head>
         <body>
           <h1>GroupMe-Discord Bridge is Running!</h1>
+          <p>Features:</p>
+          <ul>
+            <li>✅ Message bridging</li>
+            <li>✅ Image attachments</li>
+            <li>✅ Reaction notifications</li>
+          </ul>
           <p>Webhook endpoints:</p>
           <ul>
             <li>GroupMe webhook: <code>/groupme</code></li>
             <li>Discord webhook: <code>/discord</code></li>
+          </ul>
+          <p>Required environment variables:</p>
+          <ul>
+            <li><code>DISCORD_WEBHOOK_URL</code></li>
+            <li><code>GROUPME_BOT_ID</code></li>
+            <li><code>GROUPME_ACCESS_TOKEN</code> (required for reactions)</li>
           </ul>
         </body>
       </html>
@@ -141,16 +270,9 @@ const server = http.createServer(async (req, res) => {
         
         if (parsedUrl.pathname === '/groupme') {
           // Handle GroupMe webhook
-          if (data.sender_type === 'bot') {
-            // Ignore bot messages to prevent loops
-            res.writeHead(200);
-            res.end(JSON.stringify({ success: true, ignored: true }));
-            return;
-          }
-          
-          const success = await sendToDiscord(data);
-          res.writeHead(success ? 200 : 500);
-          res.end(JSON.stringify({ success }));
+          const result = await handleGroupMeWebhook(data);
+          res.writeHead(result.success ? 200 : 500);
+          res.end(JSON.stringify(result));
           
         } else if (parsedUrl.pathname === '/discord') {
           // Handle Discord webhook (if implementing two-way sync)
@@ -186,4 +308,15 @@ server.listen(PORT, () => {
   console.log(`GroupMe-Discord Bridge running on port ${PORT}`);
   console.log(`GroupMe webhook URL: http://localhost:${PORT}/groupme`);
   console.log(`Discord webhook URL: http://localhost:${PORT}/discord`);
+  
+  // Check if required environment variables are set
+  if (!DISCORD_WEBHOOK_URL) {
+    console.warn('⚠️  DISCORD_WEBHOOK_URL not set');
+  }
+  if (!GROUPME_BOT_ID) {
+    console.warn('⚠️  GROUPME_BOT_ID not set');
+  }
+  if (!GROUPME_ACCESS_TOKEN) {
+    console.warn('⚠️  GROUPME_ACCESS_TOKEN not set (required for reactions)');
+  }
 });
