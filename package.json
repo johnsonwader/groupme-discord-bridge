@@ -4,7 +4,7 @@
   "description": "Bridge between GroupMe and Discord using webhooks",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
+    "start": "node index.js",
     "test": "echo \"No tests specified\" && exit 0"
   },
   "dependencies": {
