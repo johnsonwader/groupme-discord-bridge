@@ -1,4 +1,4 @@
-// GroupMe-Discord Bridge - Main Application File with Reaction Support
+// GroupMe-Discord Bridge - Main Application File with Reaction Support and Reply Context
 const https = require('https');
 const http = require('http');
 const url = require('url');
@@ -56,6 +56,111 @@ async function getGroupMeMessage(groupId, messageId) {
   }
 }
 
+// Get messages from GroupMe group to find reply context
+async function getGroupMeMessages(groupId, beforeId = null, limit = 20) {
+  let path = `/v3/groups/${groupId}/messages?token=${GROUPME_ACCESS_TOKEN}&limit=${limit}`;
+  if (beforeId) {
+    path += `&before_id=${beforeId}`;
+  }
+
+  const options = {
+    hostname: 'api.groupme.com',
+    port: 443,
+    path: path,
+    method: 'GET',
+    protocol: 'https:',
+    headers: {
+      'User-Agent': 'GroupMe-Discord-Bridge/1.0'
+    }
+  };
+
+  try {
+    const response = await makeRequest(options);
+    if (response.statusCode === 200) {
+      const data = JSON.parse(response.body);
+      return data.response.messages;
+    }
+    return [];
+  } catch (error) {
+    console.error('Error fetching GroupMe messages:', error);
+    return [];
+  }
+}
+
+// Find the message being replied to based on attachments
+async function findReplyContext(message) {
+  // Check if message has reply attachment
+  if (!message.attachments || message.attachments.length === 0) {
+    return null;
+  }
+
+  const replyAttachment = message.attachments.find(att => att.type === 'reply');
+  if (!replyAttachment) {
+    return null;
+  }
+
+  // Get recent messages to find the one being replied to
+  const messages = await getGroupMeMessages(message.group_id, message.id, 50);
+  
+  // Find the message with matching reply ID
+  const repliedMessage = messages.find(msg => 
+    msg.id === replyAttachment.reply_id || 
+    msg.id === replyAttachment.base_reply_id
+  );
+
+  return repliedMessage;
+}
+
+// Check if message is a reply by looking for @mentions or reply patterns
+function detectReplyFromText(message, recentMessages) {
+  if (!message.text) return null;
+
+  // Look for @mention patterns
+  const mentionMatch = message.text.match(/@(\w+)/);
+  if (mentionMatch) {
+    const mentionedName = mentionMatch[1].toLowerCase();
+    
+    // Find recent message from user with similar name
+    const repliedMessage = recentMessages.find(msg => 
+      msg.name && 
+      msg.name.toLowerCase().includes(mentionedName) &&
+      msg.id !== message.id &&
+      msg.user_id !== message.user_id
+    );
+    
+    if (repliedMessage) {
+      return repliedMessage;
+    }
+  }
+
+  // Look for reply indicators in text (common patterns)
+  const replyPatterns = [
+    /^>\s*(.+)/m,  // Quote format: "> original message"
+    /^(.+):\s*$/m, // Name followed by colon
+  ];
+
+  for (const pattern of replyPatterns) {
+    const match = message.text.match(pattern);
+    if (match) {
+      const quotedText = match[1].toLowerCase();
+      
+      // Find message with similar text
+      const repliedMessage = recentMessages.find(msg => 
+        msg.text && 
+        msg.text.toLowerCase().includes(quotedText) &&
+        msg.id !== message.id &&
+        msg.user_id !== message.user_id
+      );
+      
+      if (repliedMessage) {
+        return repliedMessage;
+      }
+    }
+  }
+
+  return null;
+}
+
 // Convert GroupMe reaction emoji to Discord format
 function convertReactionEmoji(groupmeEmoji) {
   // GroupMe uses different emoji formats, this maps common ones
@@ -75,12 +180,29 @@ function convertReactionEmoji(groupmeEmoji) {
 }
 
 // Send message to Discord
-async function sendToDiscord(message) {
+async function sendToDiscord(message, replyContext = null) {
   const webhookUrl = new URL(DISCORD_WEBHOOK_URL);
+  
+  let content = message.text || '[No text content]';
+  
+  // Add reply context if available
+  if (replyContext) {
+    const originalText = replyContext.text || '[No text content]';
+    const originalAuthor = replyContext.name || 'Unknown User';
+    
+    // Create a preview of the original message (truncate if too long)
+    let originalPreview = originalText;
+    if (originalPreview.length > 150) {
+      originalPreview = originalPreview.substring(0, 147) + '...';
+    }
+    
+    // Format the reply context
+    content = `**Replying to ${originalAuthor}:** "${originalPreview}"\n\n${content}`;
+  }
   
   const payload = {
     username: message.name || 'GroupMe User',
-    content: message.text || '[No text content]',
+    content: content,
     avatar_url: message.avatar_url
   };
 
@@ -211,9 +333,29 @@ async function handleGroupMeWebhook(data) {
     return { success, type: 'reaction' };
   }
   
-  // Handle regular message
-  const success = await sendToDiscord(data);
-  return { success, type: 'message' };
+  // Handle regular message - check for reply context
+  let replyContext = null;
+  
+  if (GROUPME_ACCESS_TOKEN) {
+    // Method 1: Check for official reply attachment
+    replyContext = await findReplyContext(data);
+    
+    // Method 2: If no official reply found, try to detect from text patterns
+    if (!replyContext) {
+      const recentMessages = await getGroupMeMessages(data.group_id, data.id, 20);
+      replyContext = detectReplyFromText(data, recentMessages);
+    }
+    
+    if (replyContext) {
+      console.log(`Detected reply to message from ${replyContext.name}: "${replyContext.text?.substring(0, 50)}..."`);
+    }
+  } else {
+    console.warn('GROUPME_ACCESS_TOKEN not set - reply context detection disabled');
+  }
+  
+  // Send message with reply context to Discord
+  const success = await sendToDiscord(data, replyContext);
+  return { success, type: 'message', hasReply: !!replyContext };
 }
 
 // Create HTTP server
@@ -243,6 +385,7 @@ const server = http.createServer(async (req, res) => {
             <li>✅ Message bridging</li>
             <li>✅ Image attachments</li>
             <li>✅ Reaction notifications</li>
+            <li>✅ Reply context detection</li>
           </ul>
           <p>Webhook endpoints:</p>
           <ul>
@@ -253,7 +396,14 @@ const server = http.createServer(async (req, res) => {
           <ul>
             <li><code>DISCORD_WEBHOOK_URL</code></li>
             <li><code>GROUPME_BOT_ID</code></li>
-            <li><code>GROUPME_ACCESS_TOKEN</code> (required for reactions)</li>
+            <li><code>GROUPME_ACCESS_TOKEN</code> (required for reactions and reply context)</li>
+          </ul>
+          <p>Reply Context Detection:</p>
+          <ul>
+            <li>Official GroupMe reply attachments</li>
+            <li>@mention pattern detection</li>
+            <li>Quote format detection ("> message")</li>
+            <li>Name colon format detection</li>
           </ul>
         </body>
       </html>
@@ -317,6 +467,8 @@ server.listen(PORT, () => {
     console.warn('⚠️  GROUPME_BOT_ID not set');
   }
   if (!GROUPME_ACCESS_TOKEN) {
-    console.warn('⚠️  GROUPME_ACCESS_TOKEN not set (required for reactions)');
+    console.warn('⚠️  GROUPME_ACCESS_TOKEN not set (required for reactions and reply context)');
+  } else {
+    console.log('✅ Reply context detection enabled');
   }
 });
